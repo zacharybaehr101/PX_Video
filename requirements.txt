@@ -1,0 +1,7 @@
+opencv-python-headless==4.10.0.84
+moviepy==1.0.3
+faster-whisper==1.0.3
+Pillow==10.4.0
+numpy==1.26.4
+requests==2.32.3
+rapidfuzz==3.9.7
