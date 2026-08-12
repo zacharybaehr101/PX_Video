@@ -42,7 +42,6 @@ jobs:
           if [ -n "${{ github.event.inputs.manifest_path }}" ]; then
             echo "path=${{ github.event.inputs.manifest_path }}" >> "$GITHUB_OUTPUT"
           else
-            # Grab the manifest file(s) changed in this push
             CHANGED=$(git diff --name-only HEAD^ HEAD -- 'jobs/*.json' | head -n 1)
             echo "path=$CHANGED" >> "$GITHUB_OUTPUT"
           fi
@@ -71,8 +70,6 @@ jobs:
           if m.get('voice_audio_url'):
               print('path=./local_media/voice.mp3')
           elif m.get('speakers') and m['speakers'][0].get('clip'):
-              # No dedicated narration track - transcribe directly from the
-              # first speaker's own clip (talking-head interview audio).
               print(f\"path=./local_media/{os.path.basename(m['speakers'][0]['clip'])}\")
           else:
               sys.exit('Manifest has no voice_audio_url and no speaker clip - nothing to transcribe. Narration-only (audio-only) videos must set voice_audio_url.')
