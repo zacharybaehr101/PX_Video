@@ -1,0 +1,39 @@
+{
+  "title": "Test Video About Books!",
+  "output_prefix": "books_recap_test1",
+  "brand": "piusx",
+
+  "media_folder": "books-recap/",
+
+  "aspect_ratios": ["16:9", "9:16"],
+
+  "burn_captions": true,
+
+  "music": {
+    "mode": "specific",
+    "track": "music-library/Turn_In_The_Sun_-_Simon_Herody.mp3"
+  },
+  "music_volume_before_talk_db": -2,
+  "music_volume_db": -18,
+  "music_fade_seconds": 2.0,
+
+  "speakers": [
+    {
+      "clip": "Zachary_Baehr_interview.mov",
+      "name": "Zachary Baehr",
+      "subtitle": "Pius X Catholic High School",
+      "facetime_seconds": 5,
+      "facetime_start": "start",
+      "quotes": [
+        {
+          "text": "Here is a video test that we are going to use to make this first video about books. I am being interviewed about books. I am giving you a lot of video of me talking just so that we kind of trim that down to just the first five seconds and put my name over the top.",
+          "broll": "auto"
+        }
+      ]
+    }
+  ],
+
+  "title_cards": [
+    { "text": "Test Video About Books!", "at": "start", "duration_seconds": 2.5 }
+  ]
+}
