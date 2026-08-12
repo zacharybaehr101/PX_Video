@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 
 import cv2
 import numpy as np
@@ -212,11 +213,12 @@ def chunk_words(text: str, max_per_line: int = 3) -> list:
     return lines
 
 
-def render_title_overlay(text: str, frame_w: int, frame_h: int, brand: dict) -> np.ndarray:
+def render_title_overlay(text: str, frame_w: int, frame_h: int, brand: dict, vertical_anchor: str = "center") -> np.ndarray:
     """
     Transparent-background title text meant to sit on top of a b-roll clip
     (not a solid full-screen card). 2-3 words per line, bold, outlined for
-    legibility over any footage underneath.
+    legibility over any footage underneath. vertical_anchor moves the text
+    block to "upper", "center", or "lower" so it's not always dead-center.
     """
     canvas = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
@@ -230,7 +232,13 @@ def render_title_overlay(text: str, frame_w: int, frame_h: int, brand: dict) -> 
 
     line_h = int(font_size * 1.15)
     total_h = line_h * len(lines)
-    y = (frame_h - total_h) / 2
+
+    if vertical_anchor == "upper":
+        y = int(frame_h * 0.12)
+    elif vertical_anchor == "lower":
+        y = int(frame_h * 0.62) - total_h
+    else:
+        y = (frame_h - total_h) / 2
 
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
@@ -281,7 +289,11 @@ def render_caption(text: str, frame_w: int, frame_h: int, brand: dict) -> np.nda
 
     line_h = int(frame_h * 0.055)
     total_h = line_h * len(lines)
-    y = frame_h - total_h - int(frame_h * 0.12)
+    # Anchored above where the lower third sits (bar starts at ~0.72h) and
+    # above typical platform UI safe zones (Reels/TikTok/Shorts controls
+    # cluster in the bottom ~15-20% of the frame) - a caption glued to the
+    # very bottom edge risks getting covered on-device.
+    y = int(frame_h * 0.60) - total_h
 
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
@@ -382,7 +394,14 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
 
     lower_third_img = render_lower_third(speaker["name"], speaker.get("subtitle", ""), frame_w, frame_h, brand)
     lower_third_clip = ImageClip(lower_third_img).set_duration(face_segment_video.duration)
-    facetime_composite = CompositeVideoClip([face_segment_video, lower_third_clip]).set_duration(face_segment_video.duration)
+
+    caption_text = quote.get("text", "")
+    caption_layers = [face_segment_video, lower_third_clip]
+    if caption_text:
+        caption_img = render_caption(caption_text, frame_w, frame_h, brand)
+        caption_layers.append(ImageClip(caption_img).set_duration(face_segment_video.duration))
+
+    facetime_composite = CompositeVideoClip(caption_layers, size=(frame_w, frame_h)).set_duration(face_segment_video.duration)
 
     # Audio for the facetime window: the ACTUAL audio under this exact video span
     facetime_audio = face_clip_full.audio.subclip(ft_offset, ft_end) if face_clip_full.audio else None
@@ -391,7 +410,8 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
     audio_segments = [facetime_audio]
 
     # --- B-roll portion: several short clips rather than one long hold,
-    # voice audio continues underneath (L-cut) ---
+    # voice audio continues underneath (L-cut). Captions keep running here
+    # too, since the quote is still being spoken. ---
     remaining = duration - facetime
     if remaining > 0.3:
         broll_chunks = pick_broll_chunks(scored_media, used_broll, media_dir, remaining)
@@ -405,7 +425,14 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
                 else:
                     clip = ImageClip(path).set_duration(chunk_dur)
                 clip = smart_crop_clip(clip, frame_w, frame_h) if is_vertical else clip.resize((frame_w, frame_h))
-                video_segments.append(clip.set_duration(chunk_dur))
+                clip = clip.set_duration(chunk_dur)
+
+                if caption_text:
+                    caption_img = render_caption(caption_text, frame_w, frame_h, brand)
+                    caption_clip = ImageClip(caption_img).set_duration(chunk_dur)
+                    clip = CompositeVideoClip([clip, caption_clip], size=(frame_w, frame_h)).set_duration(chunk_dur)
+
+                video_segments.append(clip)
 
                 chunk_audio = face_clip_full.audio.subclip(
                     voice_cursor, min(voice_cursor + chunk_dur, face_clip_full.duration)
@@ -417,7 +444,14 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
             hold_end = min(voice_cursor + remaining, face_clip_full.duration)
             hold_clip = face_clip_full.subclip(voice_cursor, hold_end)
             hold_video = smart_crop_clip(hold_clip, frame_w, frame_h) if is_vertical else hold_clip.resize((frame_w, frame_h))
-            video_segments.append(hold_video.set_duration(hold_end - voice_cursor))
+            hold_video = hold_video.set_duration(hold_end - voice_cursor)
+
+            if caption_text:
+                caption_img = render_caption(caption_text, frame_w, frame_h, brand)
+                caption_clip = ImageClip(caption_img).set_duration(hold_video.duration)
+                hold_video = CompositeVideoClip([hold_video, caption_clip], size=(frame_w, frame_h)).set_duration(hold_video.duration)
+
+            video_segments.append(hold_video)
             audio_segments.append(hold_clip.audio)
 
     return video_segments, audio_segments
@@ -428,6 +462,12 @@ def build_opening_segment(manifest: dict, scored_media: list, used_broll: set, m
     """
     New default opening: 2-3s of b-roll with the title text overlaid
     (transparent background, 2-3 words/line) instead of a solid title card.
+    The text starts in a randomized position (upper/center/lower - not
+    always dead-center) and slides off (right or bottom) in the last part
+    of the opening, so it doesn't just sit static the whole time.
+    Position/direction can be forced via the manifest's title_cards entry
+    ("position": "upper"|"center"|"lower", "slide_to": "right"|"bottom")
+    for a specific look; otherwise each render picks randomly.
     Returns (video_clip, audio_clip_or_None) or None if no title_cards set.
     """
     title_cards = manifest.get("title_cards", [])
@@ -451,9 +491,29 @@ def build_opening_segment(manifest: dict, scored_media: list, used_broll: set, m
         solid = np.array(Image.new("RGBA", (frame_w, frame_h), (*hex_to_rgb(brand["title_card"]["bg_color"]), 255)))
         bg_clip = ImageClip(solid).set_duration(duration)
 
-    overlay_img = render_title_overlay(opening["text"], frame_w, frame_h, brand)
+    vertical_anchor = opening.get("position") or random.choice(["upper", "center", "lower"])
+    slide_to = opening.get("slide_to") or random.choice(["right", "bottom"])
+
+    overlay_img = render_title_overlay(opening["text"], frame_w, frame_h, brand, vertical_anchor)
     overlay_clip = ImageClip(overlay_img).set_duration(duration)
-    composite = CompositeVideoClip([bg_clip, overlay_clip]).set_duration(duration)
+
+    # Static for the first ~60% of the opening, then slides fully off-frame
+    # over the remainder - gives it some motion without being distracting
+    # for the brief window it's actually readable.
+    hold_until = duration * 0.6
+    slide_span = duration - hold_until
+
+    def position_fn(t):
+        if t <= hold_until or slide_span <= 0:
+            return (0, 0)
+        progress = (t - hold_until) / slide_span  # 0 -> 1 over the slide window
+        if slide_to == "right":
+            return (progress * frame_w, 0)
+        else:  # "bottom"
+            return (0, progress * frame_h)
+
+    overlay_clip = overlay_clip.set_position(position_fn)
+    composite = CompositeVideoClip([bg_clip, overlay_clip], size=(frame_w, frame_h)).set_duration(duration)
 
     # Opening b-roll plays with no dialogue - silence on the voice channel,
     # music (added later as a global bed) is what's heard here.
