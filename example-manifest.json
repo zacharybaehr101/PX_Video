@@ -1,0 +1,56 @@
+{
+  "title": "Senior Interview - Homecoming 2026",
+  "output_prefix": "homecoming2026_senior_interview",
+  "brand": "piusx",
+
+  "voice_audio_url": "https://your-zone.b-cdn.net/homecoming2026/voice.mp3",
+  "music": {
+    "mode": "auto",
+    "mood_tags": ["upbeat", "instrumental"],
+    "library_folder": "music-library/"
+  },
+  "music_volume_db": -18,
+
+  "media_folder": "homecoming2026/broll/",
+
+  "aspect_ratios": ["16:9", "9:16", "1:1"],
+
+  "speakers": [
+    {
+      "clip": "interview_zbaehr.mp4",
+      "name": "Zachary Baehr",
+      "subtitle": "Senior",
+      "facetime_seconds": 5,
+      "facetime_start": "start",
+      "quotes": [
+        {
+          "text": "This program changed how I see storytelling and gave me the confidence to actually put my work out there.",
+          "broll": "auto"
+        }
+      ]
+    },
+    {
+      "clip": "interview_mrbaehr.mp4",
+      "name": "Mr. Baehr",
+      "subtitle": "Digital Media Teacher",
+      "facetime_seconds": 5,
+      "facetime_start": "start",
+      "quotes": [
+        {
+          "text": "Every year I'm amazed at what these students create when you just give them the tools and get out of the way.",
+          "broll": "auto"
+        }
+      ]
+    }
+  ],
+
+  "title_cards": [
+    { "text": "Homecoming 2026", "at": "start", "duration_seconds": 3 }
+  ],
+
+  "_notes": {
+    "quotes.text": "Must closely match what's actually spoken - Whisper aligns timestamps to this text, it does not generate the caption itself.",
+    "broll": "'auto' pulls from the top-scored unused clips/photos in media_folder for this section. Or list specific filenames to force a shot.",
+    "facetime_start": "'start' (default), 'mid', or a timestamp like '00:02' within the quote's spoken duration."
+  }
+}

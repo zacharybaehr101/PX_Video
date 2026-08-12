@@ -1,0 +1,35 @@
+{
+  "name": "Pius X Catholic High School",
+  "colors": {
+    "primary_green": "#046a38",
+    "primary_gold": "#ffd100",
+    "green_dark": "#16301F",
+    "green_alt": "#234731",
+    "gold_alt": "#B5892B",
+    "white": "#FFFFFF",
+    "black": "#000000"
+  },
+  "logo_url": "https://www.piusx.net/wp-content/uploads/2026/03/Pius-X-logo-768x768.png",
+  "font": {
+    "family": "Poppins",
+    "note": "Open-source geometric sans, closest free match to Century Gothic Bold. Century Gothic itself is Monotype-licensed and not redistributable.",
+    "weights_needed": ["Bold", "SemiBold", "Regular"],
+    "google_fonts_url": "https://fonts.google.com/specimen/Poppins"
+  },
+  "lower_third": {
+    "bg_color": "#046a38",
+    "accent_color": "#ffd100",
+    "text_color": "#FFFFFF",
+    "name_weight": "Bold",
+    "title_weight": "Regular"
+  },
+  "caption": {
+    "text_color": "#FFFFFF",
+    "highlight_color": "#ffd100",
+    "outline_color": "#16301F"
+  },
+  "title_card": {
+    "bg_color": "#046a38",
+    "text_color": "#ffd100"
+  }
+}

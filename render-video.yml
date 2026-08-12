@@ -1,0 +1,111 @@
+name: Render Video
+
+on:
+  push:
+    paths:
+      - "jobs/*.json"
+  workflow_dispatch:
+    inputs:
+      manifest_path:
+        description: "Path to manifest file to render (e.g. jobs/homecoming2026.json)"
+        required: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-small-model-v1
+
+      - name: Determine manifest file
+        id: manifest
+        run: |
+          if [ -n "${{ github.event.inputs.manifest_path }}" ]; then
+            echo "path=${{ github.event.inputs.manifest_path }}" >> "$GITHUB_OUTPUT"
+          else
+            # Grab the manifest file(s) changed in this push
+            CHANGED=$(git diff --name-only HEAD^ HEAD -- 'jobs/*.json' | head -n 1)
+            echo "path=$CHANGED" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download source media from Bunny Storage
+        env:
+          BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
+          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
+        run: |
+          python scripts/fetch_bunny_media.py \
+            --manifest "${{ steps.manifest.outputs.path }}" \
+            --out-dir ./local_media
+
+      - name: Score b-roll media
+        run: |
+          python scripts/score_media.py \
+            --folder ./local_media \
+            --out ./scored_media.json
+
+      - name: Determine audio source for transcription
+        id: audio
+        run: |
+          python -c "
+          import json, os, sys
+          m = json.load(open('${{ steps.manifest.outputs.path }}'))
+          if m.get('voice_audio_url'):
+              print('path=./local_media/voice.mp3')
+          elif m.get('speakers') and m['speakers'][0].get('clip'):
+              # No dedicated narration track - transcribe directly from the
+              # first speaker's own clip (talking-head interview audio).
+              print(f\"path=./local_media/{os.path.basename(m['speakers'][0]['clip'])}\")
+          else:
+              sys.exit('Manifest has no voice_audio_url and no speaker clip - nothing to transcribe. Narration-only (audio-only) videos must set voice_audio_url.')
+          " >> "$GITHUB_OUTPUT"
+
+      - name: Transcribe voice + align quotes
+        run: |
+          python scripts/transcribe_align.py \
+            --audio "${{ steps.audio.outputs.path }}" \
+            --manifest "${{ steps.manifest.outputs.path }}" \
+            --out ./aligned.json
+
+      - name: Build video(s)
+        run: |
+          python scripts/build_video.py \
+            --manifest "${{ steps.manifest.outputs.path }}" \
+            --aligned ./aligned.json \
+            --scored ./scored_media.json \
+            --media-dir ./local_media \
+            --out-dir ./renders
+
+      - name: Upload renders to Bunny Storage
+        env:
+          BUNNY_STORAGE_API_KEY: ${{ secrets.BUNNY_STORAGE_API_KEY }}
+          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
+        run: |
+          python scripts/upload_bunny_renders.py \
+            --renders-dir ./renders \
+            --manifest "${{ steps.manifest.outputs.path }}"
+
+      - name: Upload renders as workflow artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: renders-${{ github.run_number }}
+          path: renders/
+          retention-days: 14
