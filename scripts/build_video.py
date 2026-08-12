@@ -30,14 +30,16 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import (
+    AudioClip,
     AudioFileClip,
     CompositeAudioClip,
     CompositeVideoClip,
     ImageClip,
     VideoFileClip,
+    concatenate_audioclips,
     concatenate_videoclips,
 )
-from moviepy.audio.fx.all import volumex, audio_loop
+from moviepy.audio.fx.all import volumex, audio_loop, audio_normalize
 
 FONT_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
 BRAND_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "brand.json")
@@ -52,6 +54,13 @@ ASPECT_DIMENSIONS = {
 FACE_CASCADE = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
+
+# Same tightened detection parameters as score_media.py - the default
+# minNeighbors=5 produces false positives on high-texture non-face imagery
+# (verified against real b-roll: a bookshelf photo triggered 9 false
+# "faces" at defaults, 0 at these settings, with genuine faces still caught).
+FACE_MIN_NEIGHBORS = 15
+FACE_MIN_SIZE_RATIO = 0.1
 
 MUSIC_INDEX_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "music-library-index.json")
 
@@ -73,7 +82,8 @@ def pick_auto_music(mood_tags: list, media_dir: str, target_duration: float) -> 
         if not os.path.exists(local_path):
             continue  # wasn't downloaded (e.g. index out of sync with library folder)
         overlap = len(set(t.lower() for t in track.get("mood_tags", [])) & set(t.lower() for t in mood_tags))
-        duration_gap = abs(track.get("duration_seconds", 0) - target_duration)
+        track_duration = track.get("duration_seconds") or 0  # handles missing key AND explicit null
+        duration_gap = abs(track_duration - target_duration) if track_duration else 0
         candidates.append((overlap, -duration_gap, track["file"]))
 
     if not candidates:
@@ -100,7 +110,11 @@ def hex_to_rgb(hex_color: str):
 
 def detect_face_center(frame_bgr) -> tuple:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    h, w = gray.shape
+    min_dim = int(min(h, w) * FACE_MIN_SIZE_RATIO)
+    faces = FACE_CASCADE.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=FACE_MIN_NEIGHBORS, minSize=(min_dim, min_dim)
+    )
     if len(faces) == 0:
         return None
     # Use the largest detected face
@@ -156,28 +170,83 @@ def render_lower_third(name: str, subtitle: str, frame_w: int, frame_h: int, bra
     canvas = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
-    name_font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-Bold.ttf"), size=int(frame_h * 0.045))
-    sub_font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-Regular.ttf"), size=int(frame_h * 0.03))
+    # Sized up from the original pass per feedback that the text read too small
+    name_font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-Bold.ttf"), size=int(frame_h * 0.08))
+    sub_font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-Regular.ttf"), size=int(frame_h * 0.052))
 
     bg_color = hex_to_rgb(brand["lower_third"]["bg_color"])
     accent = hex_to_rgb(brand["lower_third"]["accent_color"])
     text_color = hex_to_rgb(brand["lower_third"]["text_color"])
 
-    bar_y = int(frame_h * 0.78)
-    bar_h = int(frame_h * 0.12)
+    bar_h = int(frame_h * 0.2)
+    bar_y = int(frame_h * 0.72)
     bar_x = int(frame_w * 0.05)
-    bar_w = int(frame_w * 0.55)
+    bar_w = int(frame_w * 0.62)
 
     draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=(*bg_color, 230))
-    draw.rectangle([bar_x, bar_y, bar_x + 8, bar_y + bar_h], fill=(*accent, 255))
+    draw.rectangle([bar_x, bar_y, bar_x + 10, bar_y + bar_h], fill=(*accent, 255))
 
-    draw.text((bar_x + 30, bar_y + 12), name, font=name_font, fill=(*text_color, 255))
-    draw.text((bar_x + 30, bar_y + 12 + int(frame_h * 0.05)), subtitle, font=sub_font, fill=(*accent, 255))
+    draw.text((bar_x + 36, bar_y + int(bar_h * 0.16)), name, font=name_font, fill=(*text_color, 255))
+    draw.text((bar_x + 36, bar_y + int(bar_h * 0.16) + int(frame_h * 0.09)), subtitle, font=sub_font, fill=(*accent, 255))
+
+    return np.array(canvas)
+
+
+def chunk_words(text: str, max_per_line: int = 3) -> list:
+    """Splits text into short lines of 2-3 words, avoiding a lonely 1-word
+    trailing line where possible - used for the transparent title overlay."""
+    words = text.split()
+    lines = []
+    i = 0
+    n = len(words)
+    while i < n:
+        remaining = n - i
+        if remaining <= max_per_line:
+            size = remaining
+        elif remaining == max_per_line + 1:
+            size = max_per_line - 1  # avoid stranding a single trailing word
+        else:
+            size = max_per_line
+        lines.append(" ".join(words[i:i + size]))
+        i += size
+    return lines
+
+
+def render_title_overlay(text: str, frame_w: int, frame_h: int, brand: dict) -> np.ndarray:
+    """
+    Transparent-background title text meant to sit on top of a b-roll clip
+    (not a solid full-screen card). 2-3 words per line, bold, outlined for
+    legibility over any footage underneath.
+    """
+    canvas = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    text_color = hex_to_rgb(brand["title_card"]["text_color"])
+    outline = hex_to_rgb(brand["colors"]["black"])
+
+    lines = chunk_words(text, max_per_line=3)
+    font_size = int(frame_h * 0.09)
+    font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-Bold.ttf"), size=font_size)
+
+    line_h = int(font_size * 1.15)
+    total_h = line_h * len(lines)
+    y = (frame_h - total_h) / 2
+
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        lw = bbox[2] - bbox[0]
+        x = (frame_w - lw) / 2
+        for dx, dy in [(-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2)]:
+            draw.text((x + dx, y + dy), line, font=font, fill=(*outline, 220))
+        draw.text((x, y), line, font=font, fill=(*text_color, 255))
+        y += line_h
 
     return np.array(canvas)
 
 
 def render_title_card(text: str, frame_w: int, frame_h: int, brand: dict) -> np.ndarray:
+    """Kept for backward compatibility (solid full-screen card) - the default
+    opening is now render_title_overlay composited on b-roll instead."""
     bg = hex_to_rgb(brand["title_card"]["bg_color"])
     text_color = hex_to_rgb(brand["title_card"]["text_color"])
     canvas = Image.new("RGBA", (frame_w, frame_h), (*bg, 255))
@@ -243,8 +312,50 @@ def pick_broll(scored_media: list, used: set, media_dir: str, min_duration: floa
     return None, None
 
 
+def pick_broll_chunks(scored_media: list, used: set, media_dir: str, total_duration: float,
+                       chunk_target: float = 3.0, chunk_min: float = 1.5):
+    """
+    Splits `total_duration` into multiple short b-roll chunks (instead of one
+    clip holding for the whole remainder) so the cut has some energy/variety.
+    Cycles through top-scored unused media; if the pool runs out, reuses from
+    the top of the list rather than leaving a gap.
+    """
+    chunks = []
+    remaining = total_duration
+    pool_exhausted_reused = set()
+
+    while remaining > 0.2:
+        this_chunk = min(chunk_target, remaining)
+        if remaining - this_chunk < chunk_min and remaining - this_chunk > 0:
+            this_chunk = remaining  # avoid leaving an awkwardly short trailing sliver
+
+        path, media_type = pick_broll(scored_media, used, media_dir, min(this_chunk, chunk_min))
+        if path is None:
+            # Pool exhausted - reuse best-scored items rather than fall back to nothing
+            for item in scored_media:
+                if item["filename"] not in pool_exhausted_reused:
+                    pool_exhausted_reused.add(item["filename"])
+                    path = os.path.join(media_dir, item["filename"])
+                    media_type = item["type"]
+                    break
+        if path is None:
+            break  # truly nothing available
+
+        chunks.append((path, media_type, this_chunk))
+        remaining -= this_chunk
+
+    return chunks
+
+
 def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_media: list,
                            used_broll: set, frame_w: int, frame_h: int, brand: dict, is_vertical: bool):
+    """
+    Returns (video_segments, audio_segments) - parallel lists where each
+    audio segment is the EXACT audio that plays under its matching video
+    segment. Keeping video and audio paired per-segment (rather than
+    building one continuous voice track separately and hoping the offsets
+    line up) is what guarantees lip-sync during the facetime portion.
+    """
     timing = quote["timing"]
     if timing is None:
         return None  # flagged for manual review upstream, skip in render
@@ -265,37 +376,94 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
     else:
         ft_offset = start + _timestamp_to_seconds(facetime_start_mode)
 
-    face_segment = face_clip_full.subclip(ft_offset, min(ft_offset + facetime, face_clip_full.duration))
-    face_segment = smart_crop_clip(face_segment, frame_w, frame_h) if is_vertical else face_segment.resize((frame_w, frame_h))
+    ft_end = min(ft_offset + facetime, face_clip_full.duration)
+    face_segment = face_clip_full.subclip(ft_offset, ft_end)
+    face_segment_video = smart_crop_clip(face_segment, frame_w, frame_h) if is_vertical else face_segment.resize((frame_w, frame_h))
 
     lower_third_img = render_lower_third(speaker["name"], speaker.get("subtitle", ""), frame_w, frame_h, brand)
-    lower_third_clip = ImageClip(lower_third_img).set_duration(face_segment.duration)
-    facetime_composite = CompositeVideoClip([face_segment, lower_third_clip])
+    lower_third_clip = ImageClip(lower_third_img).set_duration(face_segment_video.duration)
+    facetime_composite = CompositeVideoClip([face_segment_video, lower_third_clip]).set_duration(face_segment_video.duration)
 
-    # --- B-roll portion: covers remainder of quote, voice audio continues ---
+    # Audio for the facetime window: the ACTUAL audio under this exact video span
+    facetime_audio = face_clip_full.audio.subclip(ft_offset, ft_end) if face_clip_full.audio else None
+
+    video_segments = [facetime_composite]
+    audio_segments = [facetime_audio]
+
+    # --- B-roll portion: several short clips rather than one long hold,
+    # voice audio continues underneath (L-cut) ---
     remaining = duration - facetime
-    broll_clip = None
     if remaining > 0.3:
-        broll_path, broll_type = pick_broll(scored_media, used_broll, media_dir, remaining)
-        if broll_path:
-            if broll_type == "video":
-                broll_clip = VideoFileClip(broll_path).subclip(0, min(remaining, VideoFileClip(broll_path).duration))
-            else:
-                broll_clip = ImageClip(broll_path).set_duration(remaining)
-            broll_clip = smart_crop_clip(broll_clip, frame_w, frame_h) if is_vertical else broll_clip.resize((frame_w, frame_h))
+        broll_chunks = pick_broll_chunks(scored_media, used_broll, media_dir, remaining)
+        voice_cursor = ft_offset + facetime  # continues from where facetime audio left off
+
+        if broll_chunks:
+            for path, media_type, chunk_dur in broll_chunks:
+                if media_type == "video":
+                    src = VideoFileClip(path)
+                    clip = src.subclip(0, min(chunk_dur, src.duration))
+                else:
+                    clip = ImageClip(path).set_duration(chunk_dur)
+                clip = smart_crop_clip(clip, frame_w, frame_h) if is_vertical else clip.resize((frame_w, frame_h))
+                video_segments.append(clip.set_duration(chunk_dur))
+
+                chunk_audio = face_clip_full.audio.subclip(
+                    voice_cursor, min(voice_cursor + chunk_dur, face_clip_full.duration)
+                ) if face_clip_full.audio else None
+                audio_segments.append(chunk_audio)
+                voice_cursor += chunk_dur
         else:
-            # No b-roll left - fall back to holding on the talking head
-            broll_clip = face_clip_full.subclip(
-                ft_offset + facetime, min(ft_offset + facetime + remaining, face_clip_full.duration)
-            ).resize((frame_w, frame_h))
+            # No b-roll available at all - hold on the talking head instead of a gap
+            hold_end = min(voice_cursor + remaining, face_clip_full.duration)
+            hold_clip = face_clip_full.subclip(voice_cursor, hold_end)
+            hold_video = smart_crop_clip(hold_clip, frame_w, frame_h) if is_vertical else hold_clip.resize((frame_w, frame_h))
+            video_segments.append(hold_video.set_duration(hold_end - voice_cursor))
+            audio_segments.append(hold_clip.audio)
 
-    segments = [facetime_composite] + ([broll_clip] if broll_clip else [])
-    video_segment = concatenate_videoclips(segments, method="compose")
+    return video_segments, audio_segments
 
-    # Voice audio for the FULL quote duration, continuous under both parts
-    voice_audio = face_clip_full.audio.subclip(start, end) if face_clip_full.audio else None
 
-    return video_segment.set_duration(duration), voice_audio
+def build_opening_segment(manifest: dict, scored_media: list, used_broll: set, media_dir: str,
+                           frame_w: int, frame_h: int, brand: dict, is_vertical: bool):
+    """
+    New default opening: 2-3s of b-roll with the title text overlaid
+    (transparent background, 2-3 words/line) instead of a solid title card.
+    Returns (video_clip, audio_clip_or_None) or None if no title_cards set.
+    """
+    title_cards = manifest.get("title_cards", [])
+    opening = next((c for c in title_cards if c.get("at") == "start"), None)
+    if opening is None:
+        return None
+
+    duration = opening.get("duration_seconds", 2.5)
+    path, media_type = pick_broll(scored_media, used_broll, media_dir, duration)
+
+    if path:
+        if media_type == "video":
+            src = VideoFileClip(path)
+            bg_clip = src.subclip(0, min(duration, src.duration))
+        else:
+            bg_clip = ImageClip(path).set_duration(duration)
+        bg_clip = smart_crop_clip(bg_clip, frame_w, frame_h) if is_vertical else bg_clip.resize((frame_w, frame_h))
+    else:
+        # No b-roll available at all - fall back to a solid brand-color card
+        # rather than failing the render.
+        solid = np.array(Image.new("RGBA", (frame_w, frame_h), (*hex_to_rgb(brand["title_card"]["bg_color"]), 255)))
+        bg_clip = ImageClip(solid).set_duration(duration)
+
+    overlay_img = render_title_overlay(opening["text"], frame_w, frame_h, brand)
+    overlay_clip = ImageClip(overlay_img).set_duration(duration)
+    composite = CompositeVideoClip([bg_clip, overlay_clip]).set_duration(duration)
+
+    # Opening b-roll plays with no dialogue - silence on the voice channel,
+    # music (added later as a global bed) is what's heard here.
+    return composite, None
+
+
+def make_silence(duration: float):
+    """A silent stereo audio clip of the given duration, for gaps in the
+    dialogue track (e.g. under the opening b-roll, where nobody's talking)."""
+    return AudioClip(lambda t: [0, 0], duration=duration, fps=44100)
 
 
 def _timestamp_to_seconds(ts: str) -> float:
@@ -313,13 +481,15 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
     is_vertical = frame_h >= frame_w
 
     used_broll = set()
-    clips, voice_tracks = [], []
+    video_segments, audio_segments = [], []
 
-    # Opening title card
-    for card in manifest.get("title_cards", []):
-        if card.get("at") == "start":
-            img = render_title_card(card["text"], frame_w, frame_h, brand)
-            clips.append(ImageClip(img).set_duration(card.get("duration_seconds", 3)))
+    # New default opening: b-roll + transparent title text, not a solid card
+    opening = build_opening_segment(manifest, scored_media, used_broll, media_dir,
+                                     frame_w, frame_h, brand, is_vertical)
+    if opening:
+        opening_video, _ = opening
+        video_segments.append(opening_video)
+        audio_segments.append(make_silence(opening_video.duration))
 
     for speaker in aligned["speakers"]:
         for quote in speaker["quotes"]:
@@ -327,23 +497,26 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
                                             frame_w, frame_h, brand, is_vertical)
             if result is None:
                 continue
-            video_seg, voice_seg = result
-            clips.append(video_seg)
-            if voice_seg:
-                voice_tracks.append(voice_seg)
+            seg_videos, seg_audios = result
+            video_segments.extend(seg_videos)
+            # Every video segment needs a matching audio segment (silence if
+            # the source had no audio track) so concatenation stays in sync.
+            for v, a in zip(seg_videos, seg_audios):
+                audio_segments.append(a if a is not None else make_silence(v.duration))
 
-    final_video = concatenate_videoclips(clips, method="compose")
+    final_video_visual = concatenate_videoclips(video_segments, method="compose")
+    voice_track = concatenate_audioclips(audio_segments)
 
-    # Mix continuous voice track under bed music
-    voice_audio = CompositeAudioClip(voice_tracks) if voice_tracks else None
+    # Real phone-recorded voice audio tends to be quiet - normalize so the
+    # spoken word is clearly audible rather than needing the viewer to
+    # crank their volume (this was inaudible-quiet before this fix).
+    voice_track = voice_track.fx(audio_normalize)
 
     music_cfg = manifest.get("music")
-    audio_tracks = []
-    if voice_audio:
-        audio_tracks.append(voice_audio)
+    audio_tracks = [voice_track]
     if music_cfg:
         if music_cfg.get("mode") == "auto":
-            chosen_file = pick_auto_music(music_cfg.get("mood_tags", []), media_dir, final_video.duration)
+            chosen_file = pick_auto_music(music_cfg.get("mood_tags", []), media_dir, final_video_visual.duration)
             if chosen_file is None:
                 print("WARNING: no music library track matched mood_tags (or index.json is out of sync) - rendering without music bed")
             music_filename = chosen_file or ""
@@ -352,19 +525,21 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
         music_path = os.path.join(media_dir, os.path.basename(music_filename))
         if os.path.exists(music_path):
             music_clip = AudioFileClip(music_path)
-            if music_clip.duration < final_video.duration:
-                # Loop shorter tracks to cover the full video rather than crashing
-                music_clip = audio_loop(music_clip, duration=final_video.duration)
+            if music_clip.duration < final_video_visual.duration:
+                music_clip = audio_loop(music_clip, duration=final_video_visual.duration)
             else:
-                music_clip = music_clip.subclip(0, final_video.duration)
+                music_clip = music_clip.subclip(0, final_video_visual.duration)
+            # Normalize the music bed too before applying the manifest's
+            # target dB, so volume is predictable regardless of the source
+            # file's original loudness.
+            music_clip = music_clip.fx(audio_normalize)
             db = manifest.get("music_volume_db", -18)
             music_clip = music_clip.fx(volumex, 10 ** (db / 20))
             audio_tracks.append(music_clip)
         else:
             print(f"WARNING: music track not found at {music_path}, rendering without music bed")
 
-    if audio_tracks:
-        final_video = final_video.set_audio(CompositeAudioClip(audio_tracks))
+    final_video = final_video_visual.set_audio(CompositeAudioClip(audio_tracks))
 
     os.makedirs(out_dir, exist_ok=True)
     aspect_label = aspect.replace(":", "x")

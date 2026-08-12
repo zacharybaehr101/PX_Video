@@ -2,19 +2,11 @@
   "_notes": "One entry per track in your Bunny Storage music-library folder. Add tracks here as you upload them so the auto-picker has something to match against. License field is required - only use tracks that are genuinely free-to-use/royalty-free for a school's public social media, and note attribution requirements if the license needs on-screen or caption credit.",
   "tracks": [
     {
-      "file": "uplifting-piano-01.mp3",
-      "duration_seconds": 142,
-      "mood_tags": ["upbeat", "instrumental", "hopeful"],
-      "bpm": 110,
-      "license": "e.g. YouTube Audio Library - No attribution required",
-      "source_url": ""
-    },
-    {
-      "file": "cinematic-build-02.mp3",
-      "duration_seconds": 98,
-      "mood_tags": ["emotional", "cinematic", "slow-build"],
-      "bpm": 80,
-      "license": "e.g. Pixabay Music - Free, no attribution required",
+      "file": "Turn In The Sun - Simon Herody.mp3",
+      "duration_seconds": null,
+      "mood_tags": ["cinematic", "inspiring"],
+      "bpm": null,
+      "license": "YouTube Audio Library - verify attribution requirement on the track's YT Audio Library listing before reuse",
       "source_url": ""
     }
   ]
