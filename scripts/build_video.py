@@ -267,45 +267,79 @@ def render_title_card(text: str, frame_w: int, frame_h: int, brand: dict) -> np.
 
 
 def render_caption(text: str, frame_w: int, frame_h: int, brand: dict) -> np.ndarray:
+    """
+    Short caption (4-5 words) on a semi-transparent dark box, sized to the
+    text rather than a fixed wide bar. Positioned low enough to clear the
+    speaker's face in a typical selfie-framed shot, and above both the
+    lower third and the bottom safe-zone that Reels/TikTok/Shorts UI
+    controls occupy.
+    """
     canvas = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-SemiBold.ttf"), size=int(frame_h * 0.04))
+    font = ImageFont.truetype(os.path.join(FONT_DIR, "Poppins-SemiBold.ttf"), size=int(frame_h * 0.045))
     text_color = hex_to_rgb(brand["caption"]["text_color"])
-    outline = hex_to_rgb(brand["caption"]["outline_color"])
 
-    max_width = int(frame_w * 0.8)
-    words = text.split()
-    lines, current = [], ""
-    for w in words:
-        test = f"{current} {w}".strip()
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] > max_width and current:
-            lines.append(current)
-            current = w
-        else:
-            current = test
-    if current:
-        lines.append(current)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-    line_h = int(frame_h * 0.055)
-    total_h = line_h * len(lines)
-    # Anchored above where the lower third sits (bar starts at ~0.72h) and
-    # above typical platform UI safe zones (Reels/TikTok/Shorts controls
-    # cluster in the bottom ~15-20% of the frame) - a caption glued to the
-    # very bottom edge risks getting covered on-device.
-    y = int(frame_h * 0.60) - total_h
+    pad_x, pad_y = int(frame_h * 0.02), int(frame_h * 0.015)
+    box_w, box_h = text_w + pad_x * 2, text_h + pad_y * 2
+    box_x = (frame_w - box_w) / 2
+    # Bottom-anchored just above the lower-third zone (bar starts ~0.72h)
+    # and clear of the face, which in a typical chest-up selfie shot ends
+    # well above this line.
+    box_y = int(frame_h * 0.70) - box_h
 
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        lw = bbox[2] - bbox[0]
-        x = (frame_w - lw) / 2
-        # Simple outline for legibility over varied b-roll
-        for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
-            draw.text((x + dx, y + dy), line, font=font, fill=(*outline, 255))
-        draw.text((x, y), line, font=font, fill=(*text_color, 255))
-        y += line_h
+    # Dark gray box, ~80% opaque (mostly solid, slight see-through)
+    draw.rounded_rectangle(
+        [box_x, box_y, box_x + box_w, box_y + box_h],
+        radius=int(box_h * 0.15), fill=(30, 30, 30, 204)
+    )
+    draw.text((box_x + pad_x, box_y + pad_y - bbox[1]), text, font=font, fill=(*text_color, 255))
 
     return np.array(canvas)
+
+
+def estimate_word_timings(text: str, start: float, end: float) -> list:
+    """
+    Fallback used when a quote has no real word-level alignment (e.g. no
+    Whisper available, or an older aligned.json). Distributes words across
+    [start, end] proportionally by character length rather than evenly, as
+    a rough stand-in for natural speaking pace. Real Whisper alignment
+    (transcribe_align.py) produces actual per-word timestamps and should
+    always be preferred over this estimate.
+    """
+    words = text.split()
+    if not words:
+        return []
+    weights = [len(w) + 1 for w in words]  # +1 so short words still get some time
+    total_weight = sum(weights)
+    duration = end - start
+    t = start
+    result = []
+    for w, weight in zip(words, weights):
+        w_dur = duration * (weight / total_weight)
+        result.append({"word": w, "start": round(t, 2), "end": round(t + w_dur, 2)})
+        t += w_dur
+    return result
+
+
+def chunk_captions(word_timings: list, quote_start: float, words_per_chunk: int = 5) -> list:
+    """
+    Groups word-level timestamps into short caption chunks (4-5 words),
+    with each chunk's on-screen window converted to LOCAL time relative to
+    the start of this quote's assembled video segment (quote_start
+    subtracted off) - matching the render timeline's own clock.
+    Returns list of (text, local_start, local_end).
+    """
+    chunks = []
+    for i in range(0, len(word_timings), words_per_chunk):
+        group = word_timings[i:i + words_per_chunk]
+        text = " ".join(w["word"] for w in group)
+        local_start = max(0, group[0]["start"] - quote_start)
+        local_end = max(local_start + 0.1, group[-1]["end"] - quote_start)
+        chunks.append((text, local_start, local_end))
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +401,11 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
     segment. Keeping video and audio paired per-segment (rather than
     building one continuous voice track separately and hoping the offsets
     line up) is what guarantees lip-sync during the facetime portion.
+
+    Captions are composited as a SEPARATE overlay pass across the whole
+    quote's assembled timeline (not baked into each facetime/b-roll piece
+    individually) so caption changes can land wherever the words actually
+    fall, independent of where the b-roll cuts happen to be.
     """
     timing = quote["timing"]
     if timing is None:
@@ -394,14 +433,9 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
 
     lower_third_img = render_lower_third(speaker["name"], speaker.get("subtitle", ""), frame_w, frame_h, brand)
     lower_third_clip = ImageClip(lower_third_img).set_duration(face_segment_video.duration)
-
-    caption_text = quote.get("text", "")
-    caption_layers = [face_segment_video, lower_third_clip]
-    if caption_text:
-        caption_img = render_caption(caption_text, frame_w, frame_h, brand)
-        caption_layers.append(ImageClip(caption_img).set_duration(face_segment_video.duration))
-
-    facetime_composite = CompositeVideoClip(caption_layers, size=(frame_w, frame_h)).set_duration(face_segment_video.duration)
+    facetime_composite = CompositeVideoClip(
+        [face_segment_video, lower_third_clip], size=(frame_w, frame_h)
+    ).set_duration(face_segment_video.duration)
 
     # Audio for the facetime window: the ACTUAL audio under this exact video span
     facetime_audio = face_clip_full.audio.subclip(ft_offset, ft_end) if face_clip_full.audio else None
@@ -410,8 +444,7 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
     audio_segments = [facetime_audio]
 
     # --- B-roll portion: several short clips rather than one long hold,
-    # voice audio continues underneath (L-cut). Captions keep running here
-    # too, since the quote is still being spoken. ---
+    # voice audio continues underneath (L-cut) ---
     remaining = duration - facetime
     if remaining > 0.3:
         broll_chunks = pick_broll_chunks(scored_media, used_broll, media_dir, remaining)
@@ -425,14 +458,7 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
                 else:
                     clip = ImageClip(path).set_duration(chunk_dur)
                 clip = smart_crop_clip(clip, frame_w, frame_h) if is_vertical else clip.resize((frame_w, frame_h))
-                clip = clip.set_duration(chunk_dur)
-
-                if caption_text:
-                    caption_img = render_caption(caption_text, frame_w, frame_h, brand)
-                    caption_clip = ImageClip(caption_img).set_duration(chunk_dur)
-                    clip = CompositeVideoClip([clip, caption_clip], size=(frame_w, frame_h)).set_duration(chunk_dur)
-
-                video_segments.append(clip)
+                video_segments.append(clip.set_duration(chunk_dur))
 
                 chunk_audio = face_clip_full.audio.subclip(
                     voice_cursor, min(voice_cursor + chunk_dur, face_clip_full.duration)
@@ -444,15 +470,28 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
             hold_end = min(voice_cursor + remaining, face_clip_full.duration)
             hold_clip = face_clip_full.subclip(voice_cursor, hold_end)
             hold_video = smart_crop_clip(hold_clip, frame_w, frame_h) if is_vertical else hold_clip.resize((frame_w, frame_h))
-            hold_video = hold_video.set_duration(hold_end - voice_cursor)
-
-            if caption_text:
-                caption_img = render_caption(caption_text, frame_w, frame_h, brand)
-                caption_clip = ImageClip(caption_img).set_duration(hold_video.duration)
-                hold_video = CompositeVideoClip([hold_video, caption_clip], size=(frame_w, frame_h)).set_duration(hold_video.duration)
-
-            video_segments.append(hold_video)
+            video_segments.append(hold_video.set_duration(hold_end - voice_cursor))
             audio_segments.append(hold_clip.audio)
+
+    # --- Caption overlay: short (4-5 word) chunks that advance across the
+    # WHOLE quote timeline, using real per-word timestamps when available
+    # (from transcribe_align.py) and falling back to a proportional
+    # estimate otherwise. Composited once over the concatenated quote
+    # video rather than per-segment. ---
+    caption_text = quote.get("text", "")
+    if caption_text:
+        word_timings = quote.get("words") or estimate_word_timings(caption_text, start, end)
+        caption_chunks = chunk_captions(word_timings, quote_start=start, words_per_chunk=5)
+
+        quote_video = concatenate_videoclips(video_segments, method="compose").set_duration(duration)
+        caption_layers = [quote_video]
+        for text, local_start, local_end in caption_chunks:
+            img = render_caption(text, frame_w, frame_h, brand)
+            clip = ImageClip(img).set_start(local_start).set_duration(local_end - local_start)
+            caption_layers.append(clip)
+
+        composed = CompositeVideoClip(caption_layers, size=(frame_w, frame_h)).set_duration(duration)
+        video_segments = [composed]  # caller flattens this back into its own sequence
 
     return video_segments, audio_segments
 
@@ -526,6 +565,32 @@ def make_silence(duration: float):
     return AudioClip(lambda t: [0, 0], duration=duration, fps=44100)
 
 
+def apply_music_envelope(clip, talk_start_time: float, before_db: float, after_db: float, fade_seconds: float):
+    """
+    Music plays louder (before_db) during the silent opening, then fades
+    down to the background level (after_db) over `fade_seconds` starting
+    the moment the speaker's audio begins - so the track has some presence
+    up front instead of sitting quiet under everything uniformly.
+    Interpolates in dB space (perceptually closer to linear) then converts
+    to a linear amplitude multiplier applied via clip.fl.
+    """
+    breakpoints_t = [0, talk_start_time, talk_start_time + fade_seconds, clip.duration]
+    breakpoints_db = [before_db, before_db, after_db, after_db]
+
+    def gain_at(t):
+        db = np.interp(t, breakpoints_t, breakpoints_db)
+        return 10 ** (db / 20)
+
+    def modify(get_frame, t):
+        frame = get_frame(t)
+        g = gain_at(t)
+        if np.isscalar(t) or (hasattr(t, "shape") and t.shape == ()):
+            return frame * g
+        return frame * g[:, None]
+
+    return clip.fl(modify)
+
+
 def _timestamp_to_seconds(ts: str) -> float:
     parts = [float(p) for p in ts.split(":")]
     return parts[0] * 60 + parts[1] if len(parts) == 2 else parts[0]
@@ -542,6 +607,7 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
 
     used_broll = set()
     video_segments, audio_segments = [], []
+    talk_start_time = 0.0  # when the first speaker's audio begins - drives the music fade
 
     # New default opening: b-roll + transparent title text, not a solid card
     opening = build_opening_segment(manifest, scored_media, used_broll, media_dir,
@@ -550,6 +616,7 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
         opening_video, _ = opening
         video_segments.append(opening_video)
         audio_segments.append(make_silence(opening_video.duration))
+        talk_start_time = opening_video.duration
 
     for speaker in aligned["speakers"]:
         for quote in speaker["quotes"]:
@@ -589,12 +656,17 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
                 music_clip = audio_loop(music_clip, duration=final_video_visual.duration)
             else:
                 music_clip = music_clip.subclip(0, final_video_visual.duration)
-            # Normalize the music bed too before applying the manifest's
-            # target dB, so volume is predictable regardless of the source
-            # file's original loudness.
+            # Normalize the music bed too before applying the volume
+            # envelope, so loudness is predictable regardless of the
+            # source file's original mastering.
             music_clip = music_clip.fx(audio_normalize)
-            db = manifest.get("music_volume_db", -18)
-            music_clip = music_clip.fx(volumex, 10 ** (db / 20))
+            music_clip = apply_music_envelope(
+                music_clip,
+                talk_start_time=talk_start_time,
+                before_db=manifest.get("music_volume_before_talk_db", -2),
+                after_db=manifest.get("music_volume_db", -18),
+                fade_seconds=manifest.get("music_fade_seconds", 2.0),
+            )
             audio_tracks.append(music_clip)
         else:
             print(f"WARNING: music track not found at {music_path}, rendering without music bed")

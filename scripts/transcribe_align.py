@@ -69,7 +69,7 @@ def find_quote_span(words: list, quote_text: str, hint: str = None):
             search_words = words[lo:hi]
             offset = lo
 
-    best_score, best_start, best_end = 0, None, None
+    best_score, best_start, best_end, best_words = 0, None, None, None
     # Slide a window roughly the size of the quote (+/- a few words for
     # filler/false-starts) across the search space.
     window_min = max(1, target_word_count - 3)
@@ -77,12 +77,14 @@ def find_quote_span(words: list, quote_text: str, hint: str = None):
 
     for win_len in range(window_min, window_max + 1):
         for i in range(len(search_words) - win_len + 1):
-            window = " ".join(w["word"] for w in search_words[i:i + win_len])
+            window_word_dicts = search_words[i:i + win_len]
+            window = " ".join(w["word"] for w in window_word_dicts)
             score = fuzz.ratio(normalize(window), target)
             if score > best_score:
                 best_score = score
-                best_start = search_words[i]["start"]
-                best_end = search_words[i + win_len - 1]["end"]
+                best_start = window_word_dicts[0]["start"]
+                best_end = window_word_dicts[-1]["end"]
+                best_words = window_word_dicts
 
     if best_start is None or best_score < 55:
         return None  # no confident match - flag for manual review
@@ -91,6 +93,10 @@ def find_quote_span(words: list, quote_text: str, hint: str = None):
         "start": round(max(0, best_start - PAD_SECONDS), 2),
         "end": round(best_end + PAD_SECONDS, 2),
         "match_confidence": best_score,
+        # Individual word timestamps for the matched span, so captions can
+        # advance word-by-word instead of showing the whole quote as one
+        # static block for the entire duration.
+        "words": [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2)} for w in best_words],
     }
 
 
