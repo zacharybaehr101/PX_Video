@@ -83,3 +83,10 @@ PARAGRAPH-TO-MANIFEST-EXAMPLE.md  how to write the paragraph Claude turns into a
   YouTube Audio Library downloads are unambiguously fine for this use.
 - Render time scales roughly linearly with number of aspect ratios
   requested — specify only the ratios you actually need in the manifest.
+- Every render produces a matching `.srt` file alongside the `.mp4` (same
+  b-roll folder in Bunny, same filename minus extension). Captions are
+  burned into the video by default; set `"burn_captions": false` in the
+  manifest to get a clean video + .srt only, for hand-finishing in Premiere.
+- Music can fade from one volume to another as talking starts — set
+  `"music_volume_before_talk_db"`, `"music_volume_db"` (after talking
+  starts), and `"music_fade_seconds"` in the manifest.

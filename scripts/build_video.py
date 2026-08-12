@@ -394,18 +394,15 @@ def pick_broll_chunks(scored_media: list, used: set, media_dir: str, total_durat
 
 
 def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_media: list,
-                           used_broll: set, frame_w: int, frame_h: int, brand: dict, is_vertical: bool):
+                           used_broll: set, frame_w: int, frame_h: int, brand: dict, is_vertical: bool,
+                           burn_captions: bool = True):
     """
-    Returns (video_segments, audio_segments) - parallel lists where each
-    audio segment is the EXACT audio that plays under its matching video
-    segment. Keeping video and audio paired per-segment (rather than
-    building one continuous voice track separately and hoping the offsets
-    line up) is what guarantees lip-sync during the facetime portion.
-
-    Captions are composited as a SEPARATE overlay pass across the whole
-    quote's assembled timeline (not baked into each facetime/b-roll piece
-    individually) so caption changes can land wherever the words actually
-    fall, independent of where the b-roll cuts happen to be.
+    Returns (video_segments, audio_segments, caption_chunks) where
+    caption_chunks is [(text, local_start, local_end), ...] relative to
+    the start of this quote's segment - always computed and returned
+    (for SRT export) regardless of whether they're actually burned into
+    the video (controlled by burn_captions / the manifest's top-level
+    "burn_captions" setting).
     """
     timing = quote["timing"]
     if timing is None:
@@ -473,27 +470,30 @@ def build_speaker_segment(speaker: dict, quote: dict, media_dir: str, scored_med
             video_segments.append(hold_video.set_duration(hold_end - voice_cursor))
             audio_segments.append(hold_clip.audio)
 
-    # --- Caption overlay: short (4-5 word) chunks that advance across the
+    # --- Caption chunks: short (4-5 word) groups that advance across the
     # WHOLE quote timeline, using real per-word timestamps when available
     # (from transcribe_align.py) and falling back to a proportional
-    # estimate otherwise. Composited once over the concatenated quote
-    # video rather than per-segment. ---
+    # estimate otherwise. Always computed (for SRT export); only burned
+    # into the video pixels when burn_captions is True. ---
     caption_text = quote.get("text", "")
+    caption_chunks = []
     if caption_text:
         word_timings = quote.get("words") or estimate_word_timings(caption_text, start, end)
         caption_chunks = chunk_captions(word_timings, quote_start=start, words_per_chunk=5)
 
         quote_video = concatenate_videoclips(video_segments, method="compose").set_duration(duration)
-        caption_layers = [quote_video]
-        for text, local_start, local_end in caption_chunks:
-            img = render_caption(text, frame_w, frame_h, brand)
-            clip = ImageClip(img).set_start(local_start).set_duration(local_end - local_start)
-            caption_layers.append(clip)
 
-        composed = CompositeVideoClip(caption_layers, size=(frame_w, frame_h)).set_duration(duration)
-        video_segments = [composed]  # caller flattens this back into its own sequence
+        if burn_captions:
+            caption_layers = [quote_video]
+            for text, local_start, local_end in caption_chunks:
+                img = render_caption(text, frame_w, frame_h, brand)
+                clip = ImageClip(img).set_start(local_start).set_duration(local_end - local_start)
+                caption_layers.append(clip)
+            quote_video = CompositeVideoClip(caption_layers, size=(frame_w, frame_h)).set_duration(duration)
 
-    return video_segments, audio_segments
+        video_segments = [quote_video]  # caller flattens this back into its own sequence
+
+    return video_segments, audio_segments, caption_chunks
 
 
 def build_opening_segment(manifest: dict, scored_media: list, used_broll: set, media_dir: str,
@@ -591,6 +591,27 @@ def apply_music_envelope(clip, talk_start_time: float, before_db: float, after_d
     return clip.fl(modify)
 
 
+def _srt_timestamp(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def write_srt(entries: list, path: str):
+    """
+    Writes a standard .srt subtitle file from (global_start, global_end, text)
+    tuples - same caption chunk text/timing already used for burned-in
+    captions, so the sidecar file always matches what's on screen (or would
+    be, if burn_captions is off). Useful for re-styling in Premiere or
+    uploading as a native platform caption track instead of burning in.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        for i, (start, end, text) in enumerate(entries, 1):
+            f.write(f"{i}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n\n")
+
+
 def _timestamp_to_seconds(ts: str) -> float:
     parts = [float(p) for p in ts.split(":")]
     return parts[0] * 60 + parts[1] if len(parts) == 2 else parts[0]
@@ -608,6 +629,9 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
     used_broll = set()
     video_segments, audio_segments = [], []
     talk_start_time = 0.0  # when the first speaker's audio begins - drives the music fade
+    cumulative_time = 0.0  # running position in the final timeline, for SRT global timestamps
+    srt_entries = []  # (global_start, global_end, text)
+    burn_captions = manifest.get("burn_captions", True)
 
     # New default opening: b-roll + transparent title text, not a solid card
     opening = build_opening_segment(manifest, scored_media, used_broll, media_dir,
@@ -617,19 +641,24 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
         video_segments.append(opening_video)
         audio_segments.append(make_silence(opening_video.duration))
         talk_start_time = opening_video.duration
+        cumulative_time = opening_video.duration
 
     for speaker in aligned["speakers"]:
         for quote in speaker["quotes"]:
             result = build_speaker_segment(speaker, quote, media_dir, scored_media, used_broll,
-                                            frame_w, frame_h, brand, is_vertical)
+                                            frame_w, frame_h, brand, is_vertical, burn_captions=burn_captions)
             if result is None:
                 continue
-            seg_videos, seg_audios = result
+            seg_videos, seg_audios, caption_chunks = result
             video_segments.extend(seg_videos)
             # Every video segment needs a matching audio segment (silence if
             # the source had no audio track) so concatenation stays in sync.
             for v, a in zip(seg_videos, seg_audios):
                 audio_segments.append(a if a is not None else make_silence(v.duration))
+
+            for text, local_start, local_end in caption_chunks:
+                srt_entries.append((cumulative_time + local_start, cumulative_time + local_end, text))
+            cumulative_time += sum(v.duration for v in seg_videos)
 
     final_video_visual = concatenate_videoclips(video_segments, method="compose")
     voice_track = concatenate_audioclips(audio_segments)
@@ -677,6 +706,10 @@ def render_aspect_ratio(manifest: dict, aligned: dict, scored_media: list, media
     aspect_label = aspect.replace(":", "x")
     out_path = os.path.join(out_dir, f"{manifest['output_prefix']}_{aspect_label}.mp4")
     final_video.write_videofile(out_path, fps=30, codec="libx264", audio_codec="aac")
+
+    srt_path = os.path.join(out_dir, f"{manifest['output_prefix']}_{aspect_label}.srt")
+    write_srt(srt_entries, srt_path)
+
     return out_path
 
 

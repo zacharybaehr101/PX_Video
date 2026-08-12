@@ -42,7 +42,7 @@ def main():
     uploaded = []
 
     for fname in sorted(os.listdir(args.renders_dir)):
-        if not fname.lower().endswith(".mp4"):
+        if not (fname.lower().endswith(".mp4") or fname.lower().endswith(".srt")):
             continue
         local_path = os.path.join(args.renders_dir, fname)
         remote_path = f"renders/{output_prefix}/{fname}"
